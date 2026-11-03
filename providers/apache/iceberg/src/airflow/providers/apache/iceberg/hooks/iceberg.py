@@ -16,11 +16,14 @@
 # under the License.
 from __future__ import annotations
 
+import time
 from functools import cached_property
 from typing import TYPE_CHECKING, Any
 
+import pyarrow as pa
 import requests
 from pyiceberg.catalog import load_catalog
+from pyiceberg.exceptions import CommitFailedException
 
 from airflow.providers.common.compat.sdk import BaseHook
 
@@ -164,6 +167,57 @@ class IcebergHook(BaseHook):
     def table_exists(self, table_name: str) -> bool:
         """Check whether a table exists in the catalog."""
         return self.catalog.table_exists(table_name)
+
+    def append(
+        self,
+        table_name: str,
+        records: list[dict[str, Any]] | pa.Table,
+        *,
+        retries: int = 8,
+    ) -> None:
+        """
+        Append rows to an Iceberg table.
+
+        ``records`` may be a list of dicts or a ``pyarrow.Table``. Dict keys that
+        are not in the table schema are dropped (same behaviour as
+        ``pa.Table.from_pylist(..., schema=table.schema().as_arrow())``).
+        Do not pass a ``RecordBatchReader``: it is consumed on the first attempt,
+        so a retry after ``CommitFailedException`` would append no rows.
+
+        On ``CommitFailedException`` the table is reloaded from the catalog and
+        the write is retried up to ``retries`` times with exponential backoff.
+        That covers a stale table handle held across another writer's commit
+        (pyiceberg's in-transaction retry does not help that case, and is off
+        when the table property ``commit.retry.num-retries`` is ``0``).
+
+        :param table_name: Fully-qualified table name (``namespace.table``).
+        :param records: Rows to append.
+        :param retries: Total attempts including the first (must be >= 1).
+        """
+        if retries < 1:
+            raise ValueError("retries must be at least 1")
+
+        delay = 0.05
+        last_error: CommitFailedException | None = None
+        for attempt in range(retries):
+            table = self.load_table(table_name)
+            arrow_schema = table.schema().as_arrow()
+            if isinstance(records, pa.Table):
+                arrow = records.select(
+                    [name for name in records.column_names if name in arrow_schema.names]
+                ).cast(arrow_schema)
+            else:
+                arrow = pa.Table.from_pylist(records, schema=arrow_schema)
+            try:
+                table.append(arrow)
+                return
+            except CommitFailedException as error:
+                last_error = error
+                if attempt == retries - 1:
+                    break
+                time.sleep(delay)
+                delay = min(delay * 2, 2.0)
+        raise RuntimeError(f"append to {table_name} failed after {retries} attempts") from last_error
 
     # ---- Schema introspection ----
 
